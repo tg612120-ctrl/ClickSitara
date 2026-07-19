@@ -331,21 +331,15 @@ def load_accounts() -> list:
             "shared TARGET_BOT)."
         )
 
-    # Wire up the promo-code feature on exactly one designated account
+    # Wire up the promo-code feature on ALL loaded accounts
     source_channel = os.environ.get("SOURCE_CHANNEL")
     if source_channel:
-        promo_account_name = os.environ.get("PROMO_ACCOUNT", "account1")
-        target = next((a for a in accounts if a.name == promo_account_name), None)
-        if target is None:
-            raise RuntimeError(
-                f"PROMO_ACCOUNT is set to '{promo_account_name}' but no such "
-                f"account exists (loaded: {', '.join(a.name for a in accounts)})."
-            )
-        target.source_channel = source_channel
-        target.profile_button_text = os.environ.get("PROFILE_BUTTON_TEXT", "Профиль")
-        target.promo_button_text = os.environ.get("PROMO_CODE_BUTTON_TEXT", "Промокод")
-        log.info("Promo-code watching enabled on %s for channel %s",
-                 target.name, source_channel)
+        for target in accounts:
+            target.source_channel = source_channel
+            target.profile_button_text = os.environ.get("PROFILE_BUTTON_TEXT", "Профиль")
+            target.promo_button_text = os.environ.get("PROMO_CODE_BUTTON_TEXT", "Промокод")
+            log.info("Promo-code watching enabled on %s for channel %s",
+                     target.name, source_channel)
 
     return accounts
 
