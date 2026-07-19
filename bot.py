@@ -139,17 +139,28 @@ class Account:
 
                     if match:
                         a, b = int(match.group(1)), int(match.group(2))
-                        options = format_buttons(followup.buttons)
+                        answer = a + b
                         self.log("Robot-check detected: %s + %s = ?", a, b)
-                        await self.notify_user(
-                            "🤖 Robot-check appeared on {bot}!\n\n"
-                            "Question: {a} + {b} = ?\n"
-                            "Answer options: {options}\n\n"
-                            "This needs to be solved manually — go tap the correct "
-                            "button in your chat with {bot}.".format(
-                                bot=self.target_bot, a=a, b=b, options=options
+                        answer_button = find_button(followup.buttons, str(answer))
+                        if answer_button:
+                            await answer_button.click()
+                            self.log("Robot-check solved: clicked '%s'", answer)
+                            await self.notify_user(
+                                f"🤖 Robot-check appeared on {self.target_bot} — "
+                                f"solved automatically: {a} + {b} = {answer} ✅"
                             )
-                        )
+                        else:
+                            options = format_buttons(followup.buttons)
+                            self.log("Robot-check answer button not found for '%s'", answer)
+                            await self.notify_user(
+                                "🤖 Robot-check appeared on {bot}!\n\n"
+                                "Question: {a} + {b} = ?\n"
+                                "Answer options: {options}\n\n"
+                                "Couldn't find a matching button — go tap the correct "
+                                "button in your chat with {bot}.".format(
+                                    bot=self.target_bot, a=a, b=b, options=options
+                                )
+                            )
                     else:
                         self.log("Follow-up wasn't a robot-check. Ignoring: %r",
                                   followup_text[:200])
