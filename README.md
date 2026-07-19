@@ -1,4 +1,4 @@
-# Кликер Userbot
+here# Кликер Userbot
 
 Automates: `/start` -> click "✨ Кликер" -> repeat every N minutes.
 
@@ -57,6 +57,18 @@ anyone with it can log into your Telegram account.
 
    (Single-account setups can still just use `SESSION_STRING` with no
    suffix — it's treated the same as `SESSION_STRING_1`.)
+
+   **Batching** (optional, useful with many accounts):
+
+   | Variable | Value |
+   |---|---|
+   | `BATCH_SIZE` | `5` (default) — how many accounts start at once |
+   | `BATCH_DELAY_SECONDS` | `5` (default) — pause between starting each batch |
+
+   With the defaults, accounts 1–5 all send `/start` right away, then the
+   bot waits 5 seconds before starting accounts 6–10, then another 5
+   seconds before 11–15, and so on. Each account still runs its own
+   independent loop afterward (every `INTERVAL_MINUTES`).
 
 4. Railway will detect the `Procfile` and run `python bot.py` as a worker.
 5. Check the deploy logs — you should see "Logged in as ..." and a
