@@ -196,7 +196,20 @@ async def main():
         except Exception as e:
             log.exception("[%s] Fatal error, this account stopped: %s", account.name, e)
 
-    await asyncio.gather(*(run_isolated(a) for a in accounts))
+    batch_size = int(os.environ.get("BATCH_SIZE", "5"))
+    batch_delay = float(os.environ.get("BATCH_DELAY_SECONDS", "5"))
+
+    tasks = []
+    for start in range(0, len(accounts), batch_size):
+        batch = accounts[start:start + batch_size]
+        log.info("Starting batch: %s", ", ".join(a.name for a in batch))
+        for account in batch:
+            tasks.append(asyncio.create_task(run_isolated(account)))
+        # Wait before starting the next batch, unless this was the last one
+        if start + batch_size < len(accounts):
+            await asyncio.sleep(batch_delay)
+
+    await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":
