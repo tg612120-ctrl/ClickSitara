@@ -1,4 +1,4 @@
-here# Кликер Userbot
+# Кликер Userbot
 
 Automates: `/start` -> click "✨ Кликер" -> repeat every N minutes.
 
@@ -73,6 +73,27 @@ anyone with it can log into your Telegram account.
 4. Railway will detect the `Procfile` and run `python bot.py` as a worker.
 5. Check the deploy logs — you should see "Logged in as ..." and a
    confirmation message will land in your Saved Messages.
+
+## Optional: promo-code redemption feature (single account only)
+
+One designated account can also watch your source channel for new posts
+that contain a **spoiler-hidden** promo code (Telegram's blurred-text
+formatting), and redeem it automatically: `/start` -> click "Профиль" ->
+click "Промокод" -> send the code -> report the bot's reply to you.
+
+This briefly pauses that account's normal Кликер cycle so the two tasks
+never talk to the target bot at the same time — the promo task always
+gets priority, and normal Кликер cycling resumes right after.
+
+| Variable | Value |
+|---|---|
+| `SOURCE_CHANNEL` | your channel's username or ID (unset = feature off) |
+| `PROMO_ACCOUNT` | which account watches it, default `account1` |
+| `PROFILE_BUTTON_TEXT` | default `Профиль` |
+| `PROMO_CODE_BUTTON_TEXT` | default `Промокод` |
+
+This only runs on the one account named in `PROMO_ACCOUNT` — it does not
+redeem the code across your other accounts.
 
 ## Notes
 
