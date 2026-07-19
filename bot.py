@@ -60,13 +60,36 @@ class Account:
         except Exception as e:
             log.error("[%s] Failed to notify user: %s", self.name, e)
 
+    async def wait_for_buttons(self, conv, max_messages: int = 5, timeout: int = 15):
+        """
+        Some bots send several messages in a row (e.g. a photo/GIF first,
+        then the actual menu/question with buttons a moment later).
+        Keep reading messages from the conversation until one has buttons,
+        or we run out of attempts / time.
+        """
+        last_msg = None
+        for _ in range(max_messages):
+            try:
+                msg = await conv.get_response(timeout=timeout)
+            except asyncio.TimeoutError:
+                return last_msg
+            last_msg = msg
+            if msg.buttons:
+                return msg
+        return last_msg
+
     async def run_cycle(self):
         """One full pass: /start -> click button -> check for robot-check question."""
         self.log("Starting cycle against %s", self.target_bot)
         try:
             async with self.client.conversation(self.target_bot, timeout=30) as conv:
                 await conv.send_message("/start")
-                menu_msg = await conv.get_response()
+                menu_msg = await self.wait_for_buttons(conv)
+
+                if menu_msg is None:
+                    self.log("No response at all after /start.")
+                    await self.notify_user("⚠️ No response at all after /start.")
+                    return
 
                 button = find_button(menu_msg.buttons, self.button_text)
                 if not button:
@@ -74,16 +97,15 @@ class Account:
                              self.button_text, menu_msg.text)
                     await self.notify_user(
                         f"⚠️ Couldn't find the '{self.button_text}' button after /start.\n"
-                        f"Menu text was:\n{menu_msg.text}"
+                        f"Last message text was:\n{menu_msg.text}"
                     )
                     return
 
                 self.log("Clicking '%s' button", self.button_text)
                 await button.click()
 
-                try:
-                    followup = await conv.get_response(timeout=15)
-                except asyncio.TimeoutError:
+                followup = await self.wait_for_buttons(conv, max_messages=3, timeout=15)
+                if followup is None:
                     self.log("No follow-up message this cycle. Nothing to do.")
                     return
 
