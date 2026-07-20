@@ -13,6 +13,11 @@ logging.basicConfig(
 )
 log = logging.getLogger("userbot")
 
+# Telethon logs its own internal update-sync chatter ("Got difference for
+# channel..." etc.) at INFO level, which drowns out our actual logs. Quiet
+# it down to WARNING so only our [account...] lines show up.
+logging.getLogger("telethon").setLevel(logging.WARNING)
+
 # Matches things like "43 + 48 = ?" (addition only, per the target bot's behavior)
 MATH_PATTERN = re.compile(r"(\d+)\s*\+\s*(\d+)\s*=\s*\?")
 
@@ -63,7 +68,7 @@ class Account:
         self.notify_chat = notify_chat
         self.interval_minutes = interval_minutes
         self.button_text = button_text
-        self.client = TelegramClient(StringSession(session_string), api_id, api_hash)
+        self.client = TelegramClient(StringSession(session_string), api_id, api_hash, catch_up=True)
 
         # Guards any conversation with the target bot, so the Кликер cycle
         # and the promo-code task never talk to it at the same moment.
@@ -250,6 +255,8 @@ class Account:
         """Watch the source channel for new posts and queue any spoiler-hidden code."""
         @self.client.on(events.NewMessage(chats=self.source_channel))
         async def _handler(event):
+            self.log("Source channel post received (id=%s). Checking for spoiler...",
+                      event.message.id)
             code = extract_spoiler_text(event.message)
             if code:
                 self.log("Detected spoiler code in source channel: %s", code)
@@ -258,6 +265,8 @@ class Account:
                     f"Queuing redemption (will run before the next Кликер cycle)..."
                 )
                 await self.promo_queue.put(code)
+            else:
+                self.log("Source channel post had no spoiler text. Ignoring.")
 
     async def run_forever(self):
         await self.client.start()
