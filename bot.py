@@ -62,7 +62,8 @@ class Account:
     def __init__(self, name: str, api_id: int, api_hash: str, session_string: str,
                  target_bot: str, notify_chat: str, interval_minutes: int, button_text: str,
                  source_channel: str = None, profile_button_text: str = "Профиль",
-                 promo_button_text: str = "Промокод"):
+                 promo_button_text: str = "Промокод",
+                 daily_bonus_button_text: str = "Ежедневка", daily_bonus_interval_minutes: int = 1445):
         self.name = name
         self.target_bot = target_bot
         self.notify_chat = notify_chat
@@ -79,6 +80,10 @@ class Account:
         self.profile_button_text = profile_button_text
         self.promo_button_text = promo_button_text
         self.promo_queue = asyncio.Queue()
+
+        # Daily bonus feature (independent of Кликер and promo-code tasks)
+        self.daily_bonus_button_text = daily_bonus_button_text
+        self.daily_bonus_interval_minutes = daily_bonus_interval_minutes
 
     def log(self, msg, *args):
         log.info(f"[{self.name}] {msg}", *args)
@@ -268,6 +273,87 @@ class Account:
             else:
                 self.log("Source channel post had no spoiler text. Ignoring.")
 
+    async def run_daily_bonus_cycle(self):
+        """/start -> Профиль -> daily-bonus button -> solve math -> click correct answer."""
+        self.log("Starting daily bonus cycle")
+        async with self.lock:
+            try:
+                async with self.client.conversation(self.target_bot, timeout=30) as conv:
+                    await conv.send_message("/start")
+                    menu_msg = await self.wait_for_buttons(conv)
+                    if menu_msg is None:
+                        await self.notify_user("⚠️ Daily bonus: no response after /start.")
+                        return
+
+                    profile_btn = find_button(menu_msg.buttons, self.profile_button_text)
+                    if not profile_btn:
+                        await self.notify_user(
+                            f"⚠️ Daily bonus: couldn't find '{self.profile_button_text}' button.\n"
+                            f"Menu text:\n{menu_msg.text}"
+                        )
+                        return
+                    await profile_btn.click()
+
+                    profile_msg = await self.wait_for_buttons(conv)
+                    if profile_msg is None:
+                        await self.notify_user("⚠️ Daily bonus: no response after Профиль.")
+                        return
+
+                    bonus_btn = find_button(profile_msg.buttons, self.daily_bonus_button_text)
+                    if not bonus_btn:
+                        await self.notify_user(
+                            f"⚠️ Daily bonus: couldn't find '{self.daily_bonus_button_text}' button.\n"
+                            f"Menu text:\n{profile_msg.text}"
+                        )
+                        return
+                    await bonus_btn.click()
+
+                    followup = await self.wait_for_buttons(conv, max_messages=5, timeout=15)
+                    if followup is None:
+                        await self.notify_user("⚠️ Daily bonus: no response after clicking bonus button.")
+                        return
+
+                    followup_text = followup.text or ""
+                    match = MATH_PATTERN.search(followup_text)
+                    if not match:
+                        self.log("Daily bonus: no math question found. Text: %r", followup_text[:200])
+                        await self.notify_user(
+                            f"⚠️ Daily bonus: expected a math question but didn't find one.\n"
+                            f"Message text:\n{followup_text}"
+                        )
+                        return
+
+                    a, b = int(match.group(1)), int(match.group(2))
+                    answer = a + b
+                    answer_button = find_button(followup.buttons, str(answer))
+                    if answer_button:
+                        await answer_button.click()
+                        self.log("Daily bonus solved: %s + %s = %s", a, b, answer)
+                        await self.notify_user(
+                            f"🎁 Daily bonus claimed on {self.target_bot} — "
+                            f"solved {a} + {b} = {answer} ✅"
+                        )
+                    else:
+                        options = format_buttons(followup.buttons)
+                        await self.notify_user(
+                            "🎁 Daily bonus question appeared but couldn't auto-click!\n\n"
+                            f"Question: {a} + {b} = ?\nOptions: {options}\n\n"
+                            "Go tap the correct button manually."
+                        )
+
+            except asyncio.TimeoutError:
+                self.log("Daily bonus cycle timed out")
+            except Exception as e:
+                log.exception("[%s] Error during daily bonus cycle: %s", self.name, e)
+                await self.notify_user(f"⚠️ Daily bonus error: {e}")
+
+    async def daily_bonus_loop(self):
+        """Runs the daily-bonus cycle every `daily_bonus_interval_minutes`, independently."""
+        while True:
+            await self.run_daily_bonus_cycle()
+            self.log("Daily bonus: sleeping for %s minutes", self.daily_bonus_interval_minutes)
+            await asyncio.sleep(self.daily_bonus_interval_minutes * 60)
+
     async def run_forever(self):
         await self.client.start()
         me = await self.client.get_me()
@@ -284,6 +370,12 @@ class Account:
                 f"\nAlso watching {self.source_channel} for spoiler promo codes "
                 f"(will pause Кликер briefly to redeem them when found)."
             )
+
+        asyncio.create_task(self.daily_bonus_loop())
+        startup_msg += (
+            f"\nAlso running daily bonus claim every {self.daily_bonus_interval_minutes} minutes."
+        )
+
         await self.notify_user(startup_msg)
 
         while True:
@@ -313,6 +405,10 @@ def load_accounts() -> list:
       PROMO_ACCOUNT        - which account name watches it, default "account1"
       PROFILE_BUTTON_TEXT  - default "Профиль"
       PROMO_CODE_BUTTON_TEXT - default "Промокод"
+
+    Daily bonus feature (runs for every account automatically):
+      DAILY_BONUS_BUTTON_TEXT      - default "Ежедневка"
+      DAILY_BONUS_INTERVAL_MINUTES - default 1445 (24h 5m)
     """
     accounts = []
 
@@ -341,6 +437,8 @@ def load_accounts() -> list:
             notify_chat=get("NOTIFY_CHAT", default="me"),
             interval_minutes=int(get("INTERVAL_MINUTES", default="10")),
             button_text=get("BUTTON_TEXT", default="Кликер"),
+            daily_bonus_button_text=get("DAILY_BONUS_BUTTON_TEXT", default="Ежедневка"),
+            daily_bonus_interval_minutes=int(get("DAILY_BONUS_INTERVAL_MINUTES", default="1445")),
         ))
         i += 1
 
