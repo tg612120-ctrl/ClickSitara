@@ -102,6 +102,53 @@ def parse_telegram_link(url: str):
 # ------------------------------------------------------------------------------
 
 
+# --- Fruit robot-check detection (new) ---------------------------------------
+# A different kind of robot-check: after /start, a message with a fruit-emoji
+# grid appears, saying "нажми на кнопку, где изображено «Вишня»" (fruit name
+# varies each time). It blocks whatever task /start was for until solved.
+ROBOT_CHECK_MARKER = "проверка на робота"
+FRUIT_NAME_PATTERN = re.compile(r"«([^»]+)»")
+
+FRUIT_EMOJI_MAP = {
+    "вишня": "🍒",
+    "виноград": "🍇",
+    "банан": "🍌",
+    "клубника": "🍓",
+    "помидор": "🍅",
+    "яблоко": "🍎",
+    "ананас": "🍍",
+    "арбуз": "🍉",
+    "кокос": "🥥",
+    "абрикос": "🍑",
+    "персик": "🍑",
+    "лимон": "🍋",
+    "апельсин": "🍊",
+    "груша": "🍐",
+    "манго": "🥭",
+    "киви": "🥝",
+    "дыня": "🍈",
+    "черника": "🫐",
+    "слива": "🍑",
+}
+
+
+def extract_target_fruit(text: str):
+    """Pull the fruit name out of «...» quotes in the robot-check text, lowercased."""
+    if not text:
+        return None
+    m = FRUIT_NAME_PATTERN.search(text)
+    if m:
+        return m.group(1).strip().lower()
+    return None
+
+
+def is_fruit_robot_check(msg) -> bool:
+    """True if this message is the fruit-emoji robot-check."""
+    text = (msg.text or "").lower()
+    return ROBOT_CHECK_MARKER in text and extract_target_fruit(msg.text) is not None
+# ------------------------------------------------------------------------------
+
+
 class Account:
     """One userbot instance tied to a single Telegram session."""
 
@@ -200,6 +247,36 @@ class Account:
             )
     # --------------------------------------------------------------------------
 
+    async def solve_fruit_robot_check(self, msg) -> bool:
+        """
+        Handle the fruit-emoji robot-check: figure out the target fruit from
+        the message text, click the matching emoji button. Returns True if
+        solved, False if the fruit/button couldn't be matched (in which case
+        we leave it alone rather than guess).
+        """
+        fruit_name = extract_target_fruit(msg.text)
+        emoji = FRUIT_EMOJI_MAP.get(fruit_name)
+        if not emoji:
+            self.log("Fruit robot-check: no emoji mapping for fruit '%s'", fruit_name)
+            await self.notify_user(
+                f"⚠️ Fruit robot-check on {self.target_bot} asked for '{fruit_name}' "
+                f"but I don't have that fruit mapped — go tap it manually."
+            )
+            return False
+
+        button = find_button(msg.buttons, emoji)
+        if not button:
+            self.log("Fruit robot-check: button for '%s' (%s) not found", fruit_name, emoji)
+            await self.notify_user(
+                f"⚠️ Fruit robot-check on {self.target_bot}: couldn't find the "
+                f"{emoji} button for '{fruit_name}' — go tap it manually."
+            )
+            return False
+
+        await button.click()
+        self.log("Fruit robot-check solved: '%s' -> %s", fruit_name, emoji)
+        return True
+
     async def wait_for_buttons(self, conv, max_messages: int = 5, timeout: int = 15):
         """
         Some bots send several messages in a row (e.g. a photo/GIF first,
@@ -207,14 +284,15 @@ class Account:
         Keep reading messages from the conversation until one has buttons,
         or we run out of attempts / time.
 
-        Also transparently handles the sponsor-subscription barrier if it
-        shows up in between: solves it and keeps waiting for the real
-        follow-up, without counting it against max_messages. If the barrier
-        never appears, this behaves exactly as before.
+        Also transparently handles the sponsor-subscription barrier and the
+        fruit-emoji robot-check if either shows up in between: solves them
+        and keeps waiting for the real follow-up, without counting it against
+        max_messages. If neither ever appears, this behaves exactly as before.
         """
         last_msg = None
         attempts = 0
         barrier_attempts = 0
+        fruit_attempts = 0
         while attempts < max_messages:
             try:
                 msg = await conv.get_response(timeout=timeout)
@@ -229,6 +307,17 @@ class Account:
                     return last_msg
                 await self.solve_subscription_barrier(msg)
                 continue  # don't count this toward attempts, keep waiting for real content
+
+            if msg.buttons and is_fruit_robot_check(msg):
+                fruit_attempts += 1
+                if fruit_attempts > 3:
+                    self.log("Fruit robot-check kept reappearing, giving up after 3 tries")
+                    return last_msg
+                solved = await self.solve_fruit_robot_check(msg)
+                if solved:
+                    continue  # don't count this toward attempts, keep waiting for real content
+                else:
+                    return msg  # couldn't match the fruit - hand back to caller rather than loop
 
             attempts += 1
             if msg.buttons:
