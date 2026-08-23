@@ -5,7 +5,9 @@ import re
 
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.tl.types import MessageEntitySpoiler
+from telethon.tl.types import MessageEntitySpoiler, User
+from telethon.tl.functions.channels import JoinChannelRequest
+from telethon.tl.functions.messages import ImportChatInviteRequest
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,6 +58,50 @@ def extract_spoiler_text(message):
     return text.strip()
 
 
+# --- Subscription barrier detection (new) -----------------------------------
+# This barrier can pop up after /start regardless of which task (Кликер,
+# promo, daily bonus) triggered the /start. It shows 1-N "Подписаться"
+# buttons (one per sponsor channel/bot) and one confirm button. Substrings
+# are used (not exact match) so minor label variations still match.
+SUBSCRIBE_BUTTON_TEXT = "подписаться"
+BARRIER_CONFIRM_BUTTON_TEXT = "выполнил"  # matches "Я выполнил(а)"
+
+
+def is_subscription_barrier(buttons) -> bool:
+    """True if this button grid looks like the sponsor-subscription barrier."""
+    return find_button(buttons, BARRIER_CONFIRM_BUTTON_TEXT) is not None
+
+
+def get_subscribe_buttons(buttons):
+    """All 'Подписаться'-style buttons in the grid (there can be 1, 2, 3, or more)."""
+    if not buttons:
+        return []
+    return [
+        b for row in buttons for b in row
+        if b.text and SUBSCRIBE_BUTTON_TEXT in b.text.lower()
+    ]
+
+
+def parse_telegram_link(url: str):
+    """
+    Classify a t.me URL from a subscribe button.
+    Returns ("invite_hash", hash), ("username", username), or None if unrecognized.
+    """
+    if not url:
+        return None
+    m = re.search(r"t\.me/\+([\w-]+)", url)
+    if m:
+        return ("invite_hash", m.group(1))
+    m = re.search(r"t\.me/joinchat/([\w-]+)", url)
+    if m:
+        return ("invite_hash", m.group(1))
+    m = re.search(r"t\.me/([\w_]+)", url)
+    if m and m.group(1).lower() != "joinchat":
+        return ("username", m.group(1))
+    return None
+# ------------------------------------------------------------------------------
+
+
 class Account:
     """One userbot instance tied to a single Telegram session."""
 
@@ -94,20 +140,97 @@ class Account:
         except Exception as e:
             log.error("[%s] Failed to notify user: %s", self.name, e)
 
+    # --- Subscription barrier solving (new, isolated from existing tasks) ---
+    async def _handle_subscribe_button(self, button):
+        """Join the channel or /start the bot behind a single 'Подписаться' button."""
+        url = getattr(button, "url", None)
+        if not url:
+            # Not a URL button (rare) - fall back to just clicking it.
+            await button.click()
+            return
+
+        parsed = parse_telegram_link(url)
+        if parsed is None:
+            self.log("Subscribe button URL not recognized: %s", url)
+            return
+
+        kind, value = parsed
+        try:
+            if kind == "invite_hash":
+                await self.client(ImportChatInviteRequest(value))
+                self.log("Subscription barrier: joined channel via invite link")
+            else:  # kind == "username"
+                entity = await self.client.get_entity(value)
+                if isinstance(entity, User) and entity.bot:
+                    await self.client.send_message(entity, "/start")
+                    self.log("Subscription barrier: started bot @%s", value)
+                else:
+                    await self.client(JoinChannelRequest(entity))
+                    self.log("Subscription barrier: joined channel @%s", value)
+        except Exception as e:
+            log.warning("[%s] Subscription barrier: failed to process '%s': %s",
+                        self.name, url, e)
+
+    async def solve_subscription_barrier(self, msg):
+        """
+        Handle the sponsor-subscription barrier: join/start every 'Подписаться'
+        button (however many there are), then click the confirm button.
+        """
+        subscribe_buttons = get_subscribe_buttons(msg.buttons)
+        self.log("Subscription barrier detected with %d subscribe button(s)",
+                  len(subscribe_buttons))
+
+        for button in subscribe_buttons:
+            await self._handle_subscribe_button(button)
+            await asyncio.sleep(1)  # small pause between joins to avoid flooding
+
+        confirm_button = find_button(msg.buttons, BARRIER_CONFIRM_BUTTON_TEXT)
+        if confirm_button:
+            await confirm_button.click()
+            self.log("Subscription barrier: clicked confirm button")
+            await self.notify_user(
+                f"🔓 Subscription barrier appeared on {self.target_bot} — "
+                f"handled automatically ({len(subscribe_buttons)} channel(s)/bot(s))."
+            )
+        else:
+            self.log("Subscription barrier: confirm button not found, could not clear it")
+            await self.notify_user(
+                f"⚠️ Subscription barrier appeared on {self.target_bot} but the "
+                f"confirm button wasn't found — may need manual action."
+            )
+    # --------------------------------------------------------------------------
+
     async def wait_for_buttons(self, conv, max_messages: int = 5, timeout: int = 15):
         """
         Some bots send several messages in a row (e.g. a photo/GIF first,
         then the actual menu/question with buttons a moment later).
         Keep reading messages from the conversation until one has buttons,
         or we run out of attempts / time.
+
+        Also transparently handles the sponsor-subscription barrier if it
+        shows up in between: solves it and keeps waiting for the real
+        follow-up, without counting it against max_messages. If the barrier
+        never appears, this behaves exactly as before.
         """
         last_msg = None
-        for _ in range(max_messages):
+        attempts = 0
+        barrier_attempts = 0
+        while attempts < max_messages:
             try:
                 msg = await conv.get_response(timeout=timeout)
             except asyncio.TimeoutError:
                 return last_msg
             last_msg = msg
+
+            if msg.buttons and is_subscription_barrier(msg.buttons):
+                barrier_attempts += 1
+                if barrier_attempts > 3:
+                    self.log("Subscription barrier kept reappearing, giving up after 3 tries")
+                    return last_msg
+                await self.solve_subscription_barrier(msg)
+                continue  # don't count this toward attempts, keep waiting for real content
+
+            attempts += 1
             if msg.buttons:
                 return msg
         return last_msg
