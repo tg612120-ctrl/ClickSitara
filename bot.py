@@ -2,8 +2,6 @@ import asyncio
 import logging
 import os
 import re
-from datetime import datetime
-from zoneinfo import ZoneInfo
 
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -22,23 +20,6 @@ logging.getLogger("telethon").setLevel(logging.WARNING)
 
 # Matches things like "43 + 48 = ?" (addition only, per the target bot's behavior)
 MATH_PATTERN = re.compile(r"(\d+)\s*\+\s*(\d+)\s*=\s*\?")
-
-# Text the target bot sends when a promo redemption fails on its end and should be retried
-PROMO_ERROR_TEXT = "Упс! Что-то сломалось"
-
-# Max number of retry attempts for a promo code if the bot reports an error
-PROMO_MAX_RETRIES = 3
-
-# Clicker task is paused during this IST window every day (6 PM - 8 PM)
-CLICKER_BLOCK_START_HOUR = 18  # 6 PM IST
-CLICKER_BLOCK_END_HOUR = 20    # 8 PM IST
-IST = ZoneInfo("Asia/Kolkata")
-
-
-def is_clicker_blocked_now() -> bool:
-    """True if current IST time falls in the daily clicker-blackout window."""
-    now_ist = datetime.now(IST)
-    return CLICKER_BLOCK_START_HOUR <= now_ist.hour < CLICKER_BLOCK_END_HOUR
 
 
 def find_button(buttons, text_substring: str):
@@ -81,8 +62,7 @@ class Account:
     def __init__(self, name: str, api_id: int, api_hash: str, session_string: str,
                  target_bot: str, notify_chat: str, interval_minutes: int, button_text: str,
                  source_channel: str = None, profile_button_text: str = "Профиль",
-                 promo_button_text: str = "Промокод",
-                 daily_bonus_button_text: str = "Ежедневка", daily_bonus_interval_minutes: int = 1445):
+                 promo_button_text: str = "Промокод"):
         self.name = name
         self.target_bot = target_bot
         self.notify_chat = notify_chat
@@ -99,10 +79,6 @@ class Account:
         self.profile_button_text = profile_button_text
         self.promo_button_text = promo_button_text
         self.promo_queue = asyncio.Queue()
-
-        # Daily bonus feature (independent of Кликер and promo-code tasks)
-        self.daily_bonus_button_text = daily_bonus_button_text
-        self.daily_bonus_interval_minutes = daily_bonus_interval_minutes
 
     def log(self, msg, *args):
         log.info(f"[{self.name}] {msg}", *args)
@@ -200,90 +176,63 @@ class Account:
                 log.exception("[%s] Error during cycle: %s", self.name, e)
                 await self.notify_user(f"⚠️ Userbot error during cycle: {e}")
 
-    async def _attempt_promo_redeem(self, conv, code: str):
-        """
-        One full pass: /start -> Профиль -> Промокод -> send the code -> read reply.
-        Returns the bot's reply text (or a placeholder string), so the caller can
-        decide whether to retry.
-        """
-        await conv.send_message("/start")
-        menu_msg = await self.wait_for_buttons(conv)
-        if menu_msg is None:
-            return None, "⚠️ Promo task: no response after /start."
-
-        profile_btn = find_button(menu_msg.buttons, self.profile_button_text)
-        if not profile_btn:
-            return None, (
-                f"⚠️ Promo task: couldn't find '{self.profile_button_text}' "
-                f"button. Menu text:\n{menu_msg.text}"
-            )
-        await profile_btn.click()
-
-        profile_msg = await self.wait_for_buttons(conv)
-        if profile_msg is None:
-            return None, (
-                f"⚠️ Promo task: no response after clicking '{self.profile_button_text}'."
-            )
-
-        promo_btn = find_button(profile_msg.buttons, self.promo_button_text)
-        if not promo_btn:
-            return None, (
-                f"⚠️ Promo task: couldn't find '{self.promo_button_text}' "
-                f"button. Menu text:\n{profile_msg.text}"
-            )
-        await promo_btn.click()
-
-        # Bot should now prompt "send your code" - just wait for that,
-        # then send the actual code as a plain message.
-        try:
-            await conv.get_response(timeout=15)
-        except asyncio.TimeoutError:
-            pass  # some bots may not send a prompt at all; try sending anyway
-
-        await conv.send_message(code)
-
-        try:
-            result_msg = await conv.get_response(timeout=15)
-            result_text = result_msg.text or "(no text in reply)"
-        except asyncio.TimeoutError:
-            result_text = "(bot didn't reply in time)"
-
-        return result_text, None
-
     async def redeem_promo(self, code: str):
-        """/start -> Профиль -> Промокод -> send the code -> report the bot's reply.
-
-        If the bot replies with its generic error text ('Упс! Что-то сломалось...'),
-        retries the whole /start -> ... -> send code flow up to PROMO_MAX_RETRIES times.
-        """
+        """/start -> Профиль -> Промокод -> send the code -> report the bot's reply."""
         self.log("Redeeming promo code: %s", code)
+
         async with self.lock:
             try:
                 async with self.client.conversation(self.target_bot, timeout=30) as conv:
-                    result_text = None
-                    for attempt in range(1, PROMO_MAX_RETRIES + 1):
-                        result_text, early_error = await self._attempt_promo_redeem(conv, code)
+                    await conv.send_message("/start")
+                    menu_msg = await self.wait_for_buttons(conv)
+                    if menu_msg is None:
+                        await self.notify_user(
+                            f"⚠️ Promo task: no response after /start for code '{code}'."
+                        )
+                        return
 
-                        if early_error:
-                            # Couldn't even get through the menu/profile/promo flow - not a
-                            # "bot said it broke" case, so don't retry, just report it.
-                            await self.notify_user(early_error)
-                            return
+                    profile_btn = find_button(menu_msg.buttons, self.profile_button_text)
+                    if not profile_btn:
+                        await self.notify_user(
+                            f"⚠️ Promo task: couldn't find '{self.profile_button_text}' "
+                            f"button. Menu text:\n{menu_msg.text}"
+                        )
+                        return
+                    await profile_btn.click()
 
-                        if result_text and PROMO_ERROR_TEXT in result_text:
-                            self.log(
-                                "Promo code '%s' got error reply on attempt %d/%d: %r",
-                                code, attempt, PROMO_MAX_RETRIES, result_text[:200]
-                            )
-                            if attempt < PROMO_MAX_RETRIES:
-                                await self.notify_user(
-                                    f"⚠️ Promo code '{code}' failed with a bot error on attempt "
-                                    f"{attempt}/{PROMO_MAX_RETRIES}. Retrying with /start..."
-                                )
-                                continue
-                        break
+                    profile_msg = await self.wait_for_buttons(conv)
+                    if profile_msg is None:
+                        await self.notify_user(
+                            f"⚠️ Promo task: no response after clicking "
+                            f"'{self.profile_button_text}'."
+                        )
+                        return
 
-                    self.log("Promo code '%s' submitted. Final reply: %r", code, (result_text or "")[:200])
+                    promo_btn = find_button(profile_msg.buttons, self.promo_button_text)
+                    if not promo_btn:
+                        await self.notify_user(
+                            f"⚠️ Promo task: couldn't find '{self.promo_button_text}' "
+                            f"button. Menu text:\n{profile_msg.text}"
+                        )
+                        return
+                    await promo_btn.click()
+
+                    # Bot should now prompt "send your code" - just wait for that,
+                    # then send the actual code as a plain message.
+                    try:
+                        await conv.get_response(timeout=15)
+                    except asyncio.TimeoutError:
+                        pass  # some bots may not send a prompt at all; try sending anyway
+
+                    await conv.send_message(code)
+
+                    try:
+                        result_msg = await conv.get_response(timeout=15)
+                        result_text = result_msg.text or "(no text in reply)"
+                    except asyncio.TimeoutError:
+                        result_text = "(bot didn't reply in time)"
+
+                    self.log("Promo code '%s' submitted. Reply: %r", code, result_text[:200])
                     await self.notify_user(
                         f"🎟 Promo code '{code}' submitted on {self.target_bot}.\n"
                         f"Bot replied:\n{result_text}"
@@ -320,87 +269,6 @@ class Account:
             else:
                 self.log("Source channel post had no spoiler text. Ignoring.")
 
-    async def run_daily_bonus_cycle(self):
-        """/start -> Профиль -> daily-bonus button -> solve math -> click correct answer."""
-        self.log("Starting daily bonus cycle")
-        async with self.lock:
-            try:
-                async with self.client.conversation(self.target_bot, timeout=30) as conv:
-                    await conv.send_message("/start")
-                    menu_msg = await self.wait_for_buttons(conv)
-                    if menu_msg is None:
-                        await self.notify_user("⚠️ Daily bonus: no response after /start.")
-                        return
-
-                    profile_btn = find_button(menu_msg.buttons, self.profile_button_text)
-                    if not profile_btn:
-                        await self.notify_user(
-                            f"⚠️ Daily bonus: couldn't find '{self.profile_button_text}' button.\n"
-                            f"Menu text:\n{menu_msg.text}"
-                        )
-                        return
-                    await profile_btn.click()
-
-                    profile_msg = await self.wait_for_buttons(conv)
-                    if profile_msg is None:
-                        await self.notify_user("⚠️ Daily bonus: no response after Профиль.")
-                        return
-
-                    bonus_btn = find_button(profile_msg.buttons, self.daily_bonus_button_text)
-                    if not bonus_btn:
-                        await self.notify_user(
-                            f"⚠️ Daily bonus: couldn't find '{self.daily_bonus_button_text}' button.\n"
-                            f"Menu text:\n{profile_msg.text}"
-                        )
-                        return
-                    await bonus_btn.click()
-
-                    followup = await self.wait_for_buttons(conv, max_messages=5, timeout=15)
-                    if followup is None:
-                        await self.notify_user("⚠️ Daily bonus: no response after clicking bonus button.")
-                        return
-
-                    followup_text = followup.text or ""
-                    match = MATH_PATTERN.search(followup_text)
-                    if not match:
-                        self.log("Daily bonus: no math question found. Text: %r", followup_text[:200])
-                        await self.notify_user(
-                            f"⚠️ Daily bonus: expected a math question but didn't find one.\n"
-                            f"Message text:\n{followup_text}"
-                        )
-                        return
-
-                    a, b = int(match.group(1)), int(match.group(2))
-                    answer = a + b
-                    answer_button = find_button(followup.buttons, str(answer))
-                    if answer_button:
-                        await answer_button.click()
-                        self.log("Daily bonus solved: %s + %s = %s", a, b, answer)
-                        await self.notify_user(
-                            f"🎁 Daily bonus claimed on {self.target_bot} — "
-                            f"solved {a} + {b} = {answer} ✅"
-                        )
-                    else:
-                        options = format_buttons(followup.buttons)
-                        await self.notify_user(
-                            "🎁 Daily bonus question appeared but couldn't auto-click!\n\n"
-                            f"Question: {a} + {b} = ?\nOptions: {options}\n\n"
-                            "Go tap the correct button manually."
-                        )
-
-            except asyncio.TimeoutError:
-                self.log("Daily bonus cycle timed out")
-            except Exception as e:
-                log.exception("[%s] Error during daily bonus cycle: %s", self.name, e)
-                await self.notify_user(f"⚠️ Daily bonus error: {e}")
-
-    async def daily_bonus_loop(self):
-        """Runs the daily-bonus cycle every `daily_bonus_interval_minutes`, independently."""
-        while True:
-            await self.run_daily_bonus_cycle()
-            self.log("Daily bonus: sleeping for %s minutes", self.daily_bonus_interval_minutes)
-            await asyncio.sleep(self.daily_bonus_interval_minutes * 60)
-
     async def run_forever(self):
         await self.client.start()
         me = await self.client.get_me()
@@ -417,23 +285,9 @@ class Account:
                 f"\nAlso watching {self.source_channel} for spoiler promo codes "
                 f"(will pause Кликер briefly to redeem them when found)."
             )
-
-        asyncio.create_task(self.daily_bonus_loop())
-        startup_msg += (
-            f"\nAlso running daily bonus claim every {self.daily_bonus_interval_minutes} minutes."
-        )
-
         await self.notify_user(startup_msg)
 
         while True:
-            if is_clicker_blocked_now():
-                self.log(
-                    "Clicker paused (%02d:00-%02d:00 IST blackout window). Checking again in 5 min.",
-                    CLICKER_BLOCK_START_HOUR, CLICKER_BLOCK_END_HOUR
-                )
-                await asyncio.sleep(5 * 60)
-                continue
-
             await self.run_cycle()
             self.log("Sleeping for %s minutes", self.interval_minutes)
             await asyncio.sleep(self.interval_minutes * 60)
@@ -460,10 +314,6 @@ def load_accounts() -> list:
       PROMO_ACCOUNT        - which account name watches it, default "account1"
       PROFILE_BUTTON_TEXT  - default "Профиль"
       PROMO_CODE_BUTTON_TEXT - default "Промокод"
-
-    Daily bonus feature (runs for every account automatically):
-      DAILY_BONUS_BUTTON_TEXT      - default "Ежедневка"
-      DAILY_BONUS_INTERVAL_MINUTES - default 1445 (24h 5m)
     """
     accounts = []
 
@@ -492,8 +342,6 @@ def load_accounts() -> list:
             notify_chat=get("NOTIFY_CHAT", default="me"),
             interval_minutes=int(get("INTERVAL_MINUTES", default="10")),
             button_text=get("BUTTON_TEXT", default="Кликер"),
-            daily_bonus_button_text=get("DAILY_BONUS_BUTTON_TEXT", default="Ежедневка"),
-            daily_bonus_interval_minutes=int(get("DAILY_BONUS_INTERVAL_MINUTES", default="1445")),
         ))
         i += 1
 
@@ -506,6 +354,7 @@ def load_accounts() -> list:
 
     # Wire up the promo-code feature on ALL loaded accounts
     source_channel = os.environ.get("SOURCE_CHANNEL")
+
     if source_channel:
         for target in accounts:
             target.source_channel = source_channel
