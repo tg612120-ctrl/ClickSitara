@@ -21,6 +21,13 @@ logging.getLogger("telethon").setLevel(logging.WARNING)
 # Matches things like "43 + 48 = ?" (addition only, per the target bot's behavior)
 MATH_PATTERN = re.compile(r"(\d+)\s*\+\s*(\d+)\s*=\s*\?")
 
+# Text the target bot sends when something glitches during the promo flow
+# (seen on profile click and on code submit). When this shows up, we retry
+# the promo task for that one account/code only.
+PROMO_ERROR_TEXT = "Упс! Что-то сломалось"
+PROMO_MAX_RETRIES = 3
+PROMO_RETRY_DELAY_SECONDS = 5
+
 
 def find_button(buttons, text_substring: str):
     """Search the 2D button grid for a button whose text contains text_substring."""
@@ -176,9 +183,46 @@ class Account:
                 log.exception("[%s] Error during cycle: %s", self.name, e)
                 await self.notify_user(f"⚠️ Userbot error during cycle: {e}")
 
-    async def redeem_promo(self, code: str):
-        """/start -> Профиль -> Промокод -> send the code -> report the bot's reply."""
-        self.log("Redeeming promo code: %s", code)
+    def _should_retry_promo(self, code: str, retry: int):
+        """Decide whether to retry the promo task after seeing the glitch text.
+
+        Returns (should_retry: bool, message_if_not: str).
+        """
+        if retry + 1 < PROMO_MAX_RETRIES:
+            return True, ""
+        message = (
+            f"❌ Promo task for code '{code}' failed {PROMO_MAX_RETRIES} times in a row "
+            f"with '{PROMO_ERROR_TEXT}'. Giving up on this account for this code."
+        )
+        self.log("Giving up on code '%s' after %s attempts.", code, PROMO_MAX_RETRIES)
+        return False, message
+
+    async def _handle_promo_glitch(self, code: str, retry: int, step_label: str):
+        """Called when PROMO_ERROR_TEXT is seen at some step of the promo flow.
+        Retries the whole promo task for this account/code only (up to
+        PROMO_MAX_RETRIES), or notifies that we're giving up.
+        """
+        self.log("Glitch text seen %s for code '%s'.", step_label, code)
+        should_retry, retry_note = self._should_retry_promo(code, retry)
+        if should_retry:
+            await self.notify_user(
+                f"⚠️ Bot glitched ('{PROMO_ERROR_TEXT}') {step_label} for code '{code}'. "
+                f"Retrying this account only (attempt {retry + 2}/{PROMO_MAX_RETRIES})..."
+            )
+            await asyncio.sleep(PROMO_RETRY_DELAY_SECONDS)
+            await self.redeem_promo(code, retry=retry + 1)
+        else:
+            await self.notify_user(retry_note)
+
+    async def redeem_promo(self, code: str, retry: int = 0):
+        """/start -> Профиль -> Промокод -> send the code -> report the bot's reply.
+
+        If the bot glitches (PROMO_ERROR_TEXT) at any step - after /start,
+        after clicking profile, after clicking promo-code, or after
+        submitting the code - we retry the whole promo task for this same
+        account/code only, up to PROMO_MAX_RETRIES times.
+        """
+        self.log("Redeeming promo code: %s (attempt %s)", code, retry + 1)
 
         async with self.lock:
             try:
@@ -189,6 +233,10 @@ class Account:
                         await self.notify_user(
                             f"⚠️ Promo task: no response after /start for code '{code}'."
                         )
+                        return
+
+                    if menu_msg.text and PROMO_ERROR_TEXT in menu_msg.text:
+                        await self._handle_promo_glitch(code, retry, "after /start")
                         return
 
                     profile_btn = find_button(menu_msg.buttons, self.profile_button_text)
@@ -208,6 +256,12 @@ class Account:
                         )
                         return
 
+                    if profile_msg.text and PROMO_ERROR_TEXT in profile_msg.text:
+                        await self._handle_promo_glitch(
+                            code, retry, f"after clicking '{self.profile_button_text}'"
+                        )
+                        return
+
                     promo_btn = find_button(profile_msg.buttons, self.promo_button_text)
                     if not promo_btn:
                         await self.notify_user(
@@ -220,7 +274,12 @@ class Account:
                     # Bot should now prompt "send your code" - just wait for that,
                     # then send the actual code as a plain message.
                     try:
-                        await conv.get_response(timeout=15)
+                        prompt_msg = await conv.get_response(timeout=15)
+                        if prompt_msg.text and PROMO_ERROR_TEXT in prompt_msg.text:
+                            await self._handle_promo_glitch(
+                                code, retry, f"after clicking '{self.promo_button_text}'"
+                            )
+                            return
                     except asyncio.TimeoutError:
                         pass  # some bots may not send a prompt at all; try sending anyway
 
@@ -233,6 +292,11 @@ class Account:
                         result_text = "(bot didn't reply in time)"
 
                     self.log("Promo code '%s' submitted. Reply: %r", code, result_text[:200])
+
+                    if PROMO_ERROR_TEXT in result_text:
+                        await self._handle_promo_glitch(code, retry, "after submitting the code")
+                        return
+
                     await self.notify_user(
                         f"🎟 Promo code '{code}' submitted on {self.target_bot}.\n"
                         f"Bot replied:\n{result_text}"
